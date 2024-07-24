@@ -1,6 +1,9 @@
 import math
 from dataclasses import dataclass
 import torch
+import torch_xla
+import torch_xla.core.xla_model as xm
+import torch_xla.distributed.xla_multiprocessing as xmp
 import torch.nn as nn
 from torch.nn import functional as F
 
@@ -213,34 +216,50 @@ class DataLoaderLite:
         return x, y
 
 # -----------------------------------------------------------------------------
-# attempt to autodetect the device
-device = "cpu"
-if torch.cuda.is_available():
-    device = "cuda"
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = "mps"
-print(f"using device: {device}")
+def train_gpt():
+    torch.manual_seed(1337)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(1337)
 
-torch.manual_seed(1337)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(1337)
+    train_loader = DataLoaderLite(B=4, T=32)
 
-train_loader = DataLoaderLite(B=4, T=32)
+    # get logits
+    model = GPT(GPTConfig())
+    model.to(device)
 
-# get logits
-model = GPT(GPTConfig())
-model.to(device)
+    # optimize!
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    for i in range(50):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        optimizer.zero_grad()
+        logits, loss = model(x, y)
+        loss.backward()
+        xm.optimizer_step(optimizer) #TORCHXLA replaces: optimizer.step()
+        print(f"step {i}, loss: {loss.item()}")
 
-# optimize!
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
-    optimizer.zero_grad()
-    logits, loss = model(x, y)
-    loss.backward()
-    optimizer.step()
-    print(f"step {i}, loss: {loss.item()}")
+# Check if TPU is available
+def is_tpu_available():
+    return xm.xrt_world_size() > 1
+
+def _mp_fn(index, flags=None):
+  train_gpt()
+
+if __name__ == '__main__':
+    # attempt to autodetect the device
+    device = "cpu"
+    if is_tpu_available(): # TPU device check
+        device = xm.xla_device()
+    elif torch.cuda.is_available():
+         device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"using device: {device}")
+
+    if is_tpu_available(): # TPU device check
+        xmp.spawn(_mp_fn, args=(), nprocs=1)
+    else:
+        train_gpt()
 
 import sys; sys.exit(0)
 
