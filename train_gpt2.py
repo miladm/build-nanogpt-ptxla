@@ -247,7 +247,7 @@ def train_gpt():
     torch.set_float32_matmul_precision('high')
 
     # get logits
-    model = GPT(GPTConfig())
+    model = GPT(GPTConfig(vocab_size=50304))
     model.to(device)
     model = torch.compile(model, backend='openxla', fullgraph=True)
 
