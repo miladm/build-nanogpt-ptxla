@@ -217,7 +217,26 @@ class DataLoaderLite:
         return x, y
 
 # -----------------------------------------------------------------------------
+# Check if TPU is available
+def is_tpu_available():
+    devices = xm.xla_real_devices()
+    if len(devices) > 0:
+        return 'TPU' in devices[0]
+    return False
+
+def get_device():
+    # attempt to autodetect the device
+    device = "cpu"
+    if is_tpu_available(): # TPU device check
+        device = xm.xla_device()
+    elif torch.cuda.is_available():
+         device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"using device: {device}")
+
 def train_gpt():
+    device = get_device()
     torch.manual_seed(1337)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(1337)
@@ -237,7 +256,8 @@ def train_gpt():
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
         optimizer.zero_grad()
-        logits, loss = model(x, y)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
         loss.backward()
         print(f"step {i}, loss: {loss.item()}")
         optimizer.step()
@@ -250,27 +270,10 @@ def train_gpt():
         tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
         print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
 
-# Check if TPU is available
-def is_tpu_available():
-    devices = xm.xla_real_devices()
-    if len(devices) > 0:
-        return 'TPU' in devices[0]
-    return False
-
 def _mp_fn(index, flags=None):
   train_gpt()
 
 if __name__ == '__main__':
-    # attempt to autodetect the device
-    device = "cpu"
-    if is_tpu_available(): # TPU device check
-        device = xm.xla_device()
-    elif torch.cuda.is_available():
-         device = "cuda"
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = "mps"
-    print(f"using device: {device}")
-
     if is_tpu_available(): # TPU device check
         xmp.spawn(_mp_fn, args=(), nprocs=1)
     else:
