@@ -234,6 +234,7 @@ def get_device():
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         device = "mps"
     print(f"using device: {device}")
+    return device
 
 def train_gpt():
     device = get_device()
@@ -256,7 +257,7 @@ def train_gpt():
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
         optimizer.zero_grad()
-        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        with torch.autocast(device_type=str(device), dtype=torch.bfloat16):
             logits, loss = model(x, y)
         loss.backward()
         print(f"step {i}, loss: {loss.item()}")
