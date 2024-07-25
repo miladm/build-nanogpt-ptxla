@@ -7,7 +7,6 @@ import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
 import torch.nn as nn
 from torch.nn import functional as F
-
 # -----------------------------------------------------------------------------
 
 class CausalSelfAttention(nn.Module):
@@ -242,13 +241,14 @@ def train_gpt():
     if torch.cuda.is_available():
         torch.cuda.manual_seed(1337)
 
-    train_loader = DataLoaderLite(B=16, T=1024)
+    train_loader = DataLoaderLite(B=8, T=1024)
 
     torch.set_float32_matmul_precision('high')
 
     # get logits
     model = GPT(GPTConfig())
     model.to(device)
+    model = torch.compile(model, backend='openxla', fullgraph=True)
 
     # optimize!
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
