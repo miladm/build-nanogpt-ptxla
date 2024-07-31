@@ -1,3 +1,4 @@
+import os
 import math
 import time
 import inspect
@@ -6,6 +7,9 @@ import torch
 import torch_xla
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
+import torch_xla.distributed.parallel_loader as pl
+import torch_xla.distributed.xla_backend
+import torch_xla.runtime as xr
 import torch.nn as nn
 from torch.nn import functional as F
 # -----------------------------------------------------------------------------
@@ -37,11 +41,6 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        # # attention (materializes the large (T,T) matrix for all the queries and keys)
-        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        # att = F.softmax(att, dim=-1)
-        # y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
@@ -81,7 +80,7 @@ class Block(nn.Module):
 class GPTConfig:
     block_size: int = 1024 # max sequence length
     vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
-    n_layer: int = 12 # number of layers
+    n_layer: int = 4 # number of layers - TODO [miladm]: bring back to 12 when DDP OOM on TorchXLA resolves
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
 
@@ -185,7 +184,7 @@ class GPT(nn.Module):
 
         return model
 
-    def configure_optimizers(self, weight_decay, learning_rate, device):
+    def configure_optimizers(self, weight_decay, learning_rate, device, master_process):
         # start with all of the candidate parameters (that require grad)
         param_dict = {pn: p for pn, p in self.named_parameters()}
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
@@ -199,12 +198,14 @@ class GPT(nn.Module):
         ]
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        if master_process:
+            print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+            print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         # Create AdamW optimizer and use the fused version if it is available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and 'cuda' in str(device) # 'TPU' does not work with fused
-        print(f"using fused AdamW: {use_fused}")
+        if master_process:
+            print(f"using fused AdamW: {use_fused}")
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer
 
@@ -212,9 +213,11 @@ class GPT(nn.Module):
 import tiktoken
 
 class DataLoaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, process_rank, num_processes, master_process):
         self.B = B
         self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
 
         # at init load tokens from disk and store them in memory
         with open('input.txt', 'r') as f:
@@ -222,11 +225,11 @@ class DataLoaderLite:
         enc = tiktoken.get_encoding('gpt2')
         tokens = enc.encode(text)
         self.tokens = torch.tensor(tokens)
-        print(f"loaded {len(self.tokens)} tokens")
-        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
+        if master_process:
+            print(f"loaded {len(self.tokens)} tokens")
 
         # state
-        self.current_position = 0
+        self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
         B, T = self.B, self.T
@@ -234,10 +237,10 @@ class DataLoaderLite:
         x = (buf[:-1]).view(B, T) # inputs
         y = (buf[1:]).view(B, T) # targets
         # advance the position in the tensor
-        self.current_position += B * T
+        self.current_position += B * T * self.num_processes
         # if loading the next batch would be out of bounds, reset
-        if self.current_position + (B * T + 1) > len(self.tokens):
-            self.current_position = 0
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.current_position = self.B * self.T * self.process_rank
         return x, y
 
 # -----------------------------------------------------------------------------
@@ -248,17 +251,28 @@ def is_tpu_available():
         return 'TPU' in devices[0]
     return False
 
+# Get the decice type as a str
 def get_device():
     # attempt to autodetect the device
     device = "cpu"
     if is_tpu_available(): # TPU device check
-        device = xm.xla_device()
+        device = str(xm.xla_device())
     elif torch.cuda.is_available():
          device = "cuda"
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         device = "mps"
     print(f"using device: {device}")
     return device
+
+# simple launch:
+# python train_gpt2.py
+# DDP launch for e.g. 8 GPUs:
+# torchrun --standalone --nproc_per_node=8 train_gpt2.py
+
+# run the training loop
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
@@ -278,7 +292,44 @@ def get_lr(it):
     return min_lr + coeff * (max_lr - min_lr)
 
 def train_gpt():
-    device = get_device()
+    # set up DDP (distributed data parallel).
+    # torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
+    
+    ddp = False
+    # if torch.cuda.is_available():
+    #     ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+    # else: # XLA device
+    #     ddp = xm.get_ordinal() != -1 # is this a ddp run?
+    num_devices = len(xm.xla_real_devices())
+    print("num devices", num_devices, xm.xla_real_devices())
+
+    if ddp:
+        # use of DDP atm demands CUDA, we set the device appropriately according to rank
+        assert torch.cuda.is_available() or is_tpu_available(), "for now i think we need CUDA or XLA for DDP"
+        if torch.cuda.is_available():
+            init_process_group(backend='nccl')
+            ddp_rank = int(os.environ['RANK'])
+            ddp_local_rank = int(os.environ['LOCAL_RANK'])
+            ddp_world_size = int(os.environ['WORLD_SIZE'])
+            device = f'cuda:{ddp_local_rank}'
+            torch.cuda.set_device(device)
+        else: # XLA device
+            os.environ['PJRT_DEVICE'] = 'TPU'
+            ddp_rank = xm.get_ordinal()
+            ddp_local_rank = xm.get_ordinal()
+            ddp_world_size = xr.world_size()
+            init_process_group(backend='xla', rank=ddp_rank, world_size=ddp_world_size, init_method='xla://')
+            device = xm.xla_device() #f'xla:{ddp_local_rank}'
+        master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+    else:
+        # vanilla, non-DDP run
+        ddp_rank = 0
+        ddp_local_rank = 0
+        ddp_world_size = 1
+        master_process = True
+        # attempt to autodetect device
+        device = get_device()
+
     torch.manual_seed(1337)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(1337)
@@ -286,22 +337,33 @@ def train_gpt():
     total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
     B = 8 # micro batch size
     T = 1024 # sequence length
-    assert total_batch_size % (B * T) == 0, "make sure total_batch_size is divisible by B * T"
-    grad_accum_steps = total_batch_size // (B * T)
-    print(f"total desired batch size: {total_batch_size}")
-    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+    assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
+    grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+    if master_process:
+        print(f"total desired batch size: {total_batch_size}")
+        print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
-    train_loader = DataLoaderLite(B=B, T=T)
+    train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, master_process=master_process)
 
     torch.set_float32_matmul_precision('high')
 
-    # get logits
+    # create model
     model = GPT(GPTConfig(vocab_size=50304))
     model.to(device)
-    model = torch.compile(model, backend='openxla', fullgraph=True)
+    if torch.cuda.is_available():
+        model = torch.compile(model)
+    else: # XLA device
+        model = torch.compile(model, backend='openxla', fullgraph=True)
+    if ddp:
+        if torch.cuda.is_available():
+            model = DDP(model, device_ids=[ddp_local_rank])
+        else: # XLA device
+            xm.broadcast_master_param(model)
+            model = DDP(model, gradient_as_bucket_view=True, broadcast_buffers=False)
+    raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
     # optimize!
-    optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+    optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device, master_process=master_process)
     for step in range(max_steps):
         t0 = time.time()
         optimizer.zero_grad()
@@ -317,70 +379,82 @@ def train_gpt():
             # instead of a SUM we want MEAN. Scale the loss here so it comes out right
             loss = loss / grad_accum_steps
             loss_accum += loss.detach()
+            if ddp:
+                model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
             loss.backward()
-            xm.mark_step()
+            xm.mark_step() # wait for the XLA device to finish work
+        if ddp:
+            if torch.cuda.is_available():
+                dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+            else: # XLA device
+                loss_accum /= 4 # Number of XLA devices in TPUv4-8
+                dist.all_reduce(loss_accum, op=dist.ReduceOp.SUM) #https://github.com/pytorch/xla/issues/7782
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         # determine and set the learning rate for this iteration
         lr = get_lr(step)
         for param_group in optimizer.param_groups:
-            param_group['lr'] = lr        
+            param_group['lr'] = lr
         print(f"step {step}, loss: {loss.item()}")
         optimizer.step()
-        if is_tpu_available():
-            xm.mark_step()
-        else:
+        if torch.cuda.is_available():
             torch.cuda.synchronize() # wait for the GPU to finish work
+        else:
+            xm.mark_step() # wait for the XLA device to finish work
         t1 = time.time()
         dt = t1 - t0 # time difference in seconds
-        tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
+        tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
         tokens_per_sec = tokens_processed / dt
-        print(f"step {step:4d} | loss: {loss_accum.item():.6f}| lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+        if master_process:
+            print(f"step {step:4d} | loss: {loss_accum.item():.6f}| lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+    if ddp:
+        destroy_process_group()
 
-def _mp_fn(index, flags=None):
-  train_gpt()
+def _mp_fn(rank):
+    train_gpt()
 
 if __name__ == '__main__':
-    if is_tpu_available(): # TPU device check
-        xmp.spawn(_mp_fn, args=(), nprocs=1)
-    else:
+    if torch.cuda.is_available():
         train_gpt()
+    else: # XLA Device
+        xmp.spawn(_mp_fn)
 
-import sys; sys.exit(0)
+# Adding sys.exit() at this line causes a crash of torch_xla run - commenting out everything
+# import sys; sys.exit(0)
 
-# prefix tokens
-model.eval()
-num_return_sequences = 5
-max_length = 30
-tokens = enc.encode("Hello, I'm a language model,")
-tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
-x = tokens.to(device)
+# # prefix tokens
+# model.eval()
+# num_return_sequences = 5
+# max_length = 30
+# tokens = enc.encode("Hello, I'm a language model,")
+# tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
+# tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
+# x = tokens.to(device)
 
-# generate! right now x is (B, T) where B = 5, T = 8
-# set the seed to 42
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-while x.size(1) < max_length:
-    # forward the model to get the logits
-    with torch.no_grad():
-        logits = model(x) # (B, T, vocab_size)
-        # take the logits at the last position
-        logits = logits[:, -1, :] # (B, vocab_size)
-        # get the probabilities
-        probs = F.softmax(logits, dim=-1)
-        # do top-k sampling of 50 (huggingface pipeline default)
-        # topk_probs here becomes (5, 50), topk_indices is (5, 50)
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-        # select a token from the top-k probabilities
-        # note: multinomial does not demand the input to sum to 1
-        ix = torch.multinomial(topk_probs, 1) # (B, 1)
-        # gather the corresponding indices
-        xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
-        # append to the sequence
-        x = torch.cat((x, xcol), dim=1)
+# # generate! right now x is (B, T) where B = 5, T = 8
+# # set the seed to 42
+# torch.manual_seed(42)
+# torch.cuda.manual_seed(42)
+# while x.size(1) < max_length:
+#     # forward the model to get the logits
+#     with torch.no_grad():
+#         logits = model(x) # (B, T, vocab_size)
+#         # take the logits at the last position
+#         logits = logits[:, -1, :] # (B, vocab_size)
+#         # get the probabilities
+#         probs = F.softmax(logits, dim=-1)
+#         # do top-k sampling of 50 (huggingface pipeline default)
+#         # topk_probs here becomes (5, 50), topk_indices is (5, 50)
+#         topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+#         # select a token from the top-k probabilities
+#         # note: multinomial does not demand the input to sum to 1
+#         ix = torch.multinomial(topk_probs, 1) # (B, 1)
+#         # gather the corresponding indices
+#         xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+#         # append to the sequence
+#         x = torch.cat((x, xcol), dim=1)
 
-# print the generated text
-for i in range(num_return_sequences):
-    tokens = x[i, :max_length].tolist()
-    decoded = enc.decode(tokens)
-    print(">", decoded)
+# # print the generated text
+# for i in range(num_return_sequences):
+#     tokens = x[i, :max_length].tolist()
+#     decoded = enc.decode(tokens)
+#     print(">", decoded)
