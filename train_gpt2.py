@@ -80,7 +80,7 @@ class Block(nn.Module):
 class GPTConfig:
     block_size: int = 1024 # max sequence length
     vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
-    n_layer: int = 4 # number of layers - TODO [miladm]: bring back to 12 when DDP OOM on TorchXLA resolves
+    n_layer: int = 4 # number of layers - TODO [miladm]: assign 12 when DDP OOM fixes - https://github.com/pytorch/xla/issues/7791
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
 
@@ -296,12 +296,10 @@ def train_gpt():
     # torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
     
     ddp = False
-    # if torch.cuda.is_available():
-    #     ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
-    # else: # XLA device
-    #     ddp = xm.get_ordinal() != -1 # is this a ddp run?
-    num_devices = len(xm.xla_real_devices())
-    print("num devices", num_devices, xm.xla_real_devices())
+    if torch.cuda.is_available():
+        ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+    else: # XLA device
+        ddp = xm.get_ordinal() != -1 # is this a ddp run?
 
     if ddp:
         # use of DDP atm demands CUDA, we set the device appropriately according to rank
