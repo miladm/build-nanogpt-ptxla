@@ -300,7 +300,6 @@ def train_gpt():
         ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
     else: # XLA device
         ddp = xm.get_ordinal() != -1 # is this a ddp run?
-
     if ddp:
         # use of DDP atm demands CUDA, we set the device appropriately according to rank
         assert torch.cuda.is_available() or is_tpu_available(), "for now i think we need CUDA or XLA for DDP"
@@ -385,7 +384,7 @@ def train_gpt():
             if torch.cuda.is_available():
                 dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
             else: # XLA device
-                loss_accum /= 4 # Number of XLA devices in TPUv4-8
+                loss_accum /= xr.global_runtime_device_count()
                 dist.all_reduce(loss_accum, op=dist.ReduceOp.SUM) #https://github.com/pytorch/xla/issues/7782
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         # determine and set the learning rate for this iteration
