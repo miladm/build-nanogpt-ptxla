@@ -80,7 +80,7 @@ class Block(nn.Module):
 class GPTConfig:
     block_size: int = 1024 # max sequence length
     vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
-    n_layer: int = 4 # number of layers - TODO [miladm]: assign 12 when DDP OOM fixes - https://github.com/pytorch/xla/issues/7791
+    n_layer: int = 12 # number of layers - TODO [miladm]: assign 12 when DDP OOM fixes - https://github.com/pytorch/xla/issues/7791
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
 
@@ -244,6 +244,13 @@ class DataLoaderLite:
         return x, y
 
 # -----------------------------------------------------------------------------
+import torch_xla.distributed.spmd.xla_sharding as xs
+import torch_xla.runtime as xr
+import numpy as np
+
+# Enable XLA SPMD execution mode.
+xr.use_spmd()
+
 # Check if TPU is available
 def is_tpu_available():
     devices = xm.xla_real_devices()
@@ -291,6 +298,7 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
     return min_lr + coeff * (max_lr - min_lr)
 
+spmd = True
 def train_gpt():
     # set up DDP (distributed data parallel).
     # torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
@@ -298,7 +306,7 @@ def train_gpt():
     ddp = False
     if torch.cuda.is_available():
         ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
-    else: # XLA device
+    elif ddp: # XLA device
         ddp = xm.get_ordinal() != -1 # is this a ddp run?
     if ddp:
         # use of DDP atm demands CUDA, we set the device appropriately according to rank
@@ -317,6 +325,18 @@ def train_gpt():
             ddp_world_size = xr.world_size()
             init_process_group(backend='xla', rank=ddp_rank, world_size=ddp_world_size, init_method='xla://')
             device = xm.xla_device() #f'xla:{ddp_local_rank}'
+        master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+    elif spmd:
+        num_devices = xr.global_runtime_device_count()
+        device_ids = np.arange(num_devices)
+        mesh_shape = (num_devices, 1)
+        mesh = xs.Mesh(device_ids, mesh_shape, ('batch',None))
+        xs.set_global_mesh(mesh)
+
+        ddp_rank = xm.get_ordinal()
+        ddp_local_rank = xm.get_ordinal()
+        ddp_world_size = xr.world_size()
+        device = xm.xla_device() #f'xla:{ddp_local_rank}'
         master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
     else:
         # vanilla, non-DDP run
@@ -368,6 +388,10 @@ def train_gpt():
         for micro_step in range(grad_accum_steps):
             x, y = train_loader.next_batch()
             x, y = x.to(device), y.to(device)
+            mesh = xs.get_global_mesh()
+            if spmd:
+                xs.mark_sharding(x, mesh, ('batch', None))
+                xs.mark_sharding(y, mesh, ('batch', None))
             with torch.autocast(device_type=str(device), dtype=torch.bfloat16):
                 logits, loss = model(x, y)
             # we have to scale the loss to account for gradient accumulation,
@@ -413,7 +437,10 @@ if __name__ == '__main__':
     if torch.cuda.is_available():
         train_gpt()
     else: # XLA Device
-        xmp.spawn(_mp_fn)
+        if spmd:
+            _mp_fn(None)
+        else:
+            xmp.spawn(_mp_fn)
 
 # Adding sys.exit() at this line causes a crash of torch_xla run - commenting out everything
 # import sys; sys.exit(0)
